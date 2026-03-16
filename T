@@ -1,0 +1,113 @@
+name: Blue/Green Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: my-app
+  ECS_CLUSTER: my-cluster
+  ECS_SERVICE_BLUE: my-app-blue
+  ECS_SERVICE_GREEN: my-app-green
+  CONTAINER_NAME: my-app
+  ALB_LISTENER_ARN: arn:aws:elasticloadbalancing:...
+  TARGET_GROUP_BLUE: arn:aws:elasticloadbalancing:...:targetgroup/my-app-blue/...
+  TARGET_GROUP_GREEN: arn:aws:elasticloadbalancing:...:targetgroup/my-app-green/...
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Determine live/idle environments
+        id: env-check
+        run: |
+          LISTENER=$(aws elbv2 describe-listeners \
+            --listener-arns ${{ env.ALB_LISTENER_ARN }} \
+            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+            --output text)
+          if [ "$LISTENER" == "${{ env.TARGET_GROUP_BLUE }}" ]; then
+            echo "live=blue" >> $GITHUB_OUTPUT
+            echo "idle=green" >> $GITHUB_OUTPUT
+            echo "idle_service=${{ env.ECS_SERVICE_GREEN }}" >> $GITHUB_OUTPUT
+            echo "idle_tg=${{ env.TARGET_GROUP_GREEN }}" >> $GITHUB_OUTPUT
+          else
+            echo "live=green" >> $GITHUB_OUTPUT
+            echo "idle=blue" >> $GITHUB_OUTPUT
+            echo "idle_service=${{ env.ECS_SERVICE_BLUE }}" >> $GITHUB_OUTPUT
+            echo "idle_tg=${{ env.TARGET_GROUP_BLUE }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to idle ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ steps.env-check.outputs.idle_service }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Smoke test idle environment
+        run: |
+          # Optional: hit a health endpoint directly on the idle target group
+          echo "Running smoke tests..."
+          # curl https://green-internal.yourdomain.com/health
+
+      - name: Shift ALB traffic to idle (new version)
+        run: |
+          aws elbv2 modify-listener \
+            --listener-arn ${{ env.ALB_LISTENER_ARN }} \
+            --default-actions \
+              Type=forward,TargetGroupArn=${{ steps.env-check.outputs.idle_tg }}
+
+      - name: Verify deployment health
+        run: |
+          sleep 30
+          STATUS=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ steps.env-check.outputs.idle_service }} \
+            --query 'services[0].deployments[0].rolloutState' \
+            --output text)
+          if [ "$STATUS" != "COMPLETED" ]; then
+            echo "Deployment unhealthy, rolling back..."
+            exit 1
+          fi
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          LIVE_TG=${{ steps.env-check.outputs.idle_tg == env.TARGET_GROUP_BLUE && env.TARGET_GROUP_GREEN || env.TARGET_GROUP_BLUE }}
+          aws elbv2 modify-listener \
+            --listener-arn ${{ env.ALB_LISTENER_ARN }} \
+            --default-actions Type=forward,TargetGroupArn=$LIVE_TG
+          echo "Rolled back to previous environment"
